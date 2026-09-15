@@ -1,0 +1,139 @@
+# Test sync: quay fork (test-ci-gen) → openshift/release fork (main).
+# Requires repo secret OPENSHIFT_RELEASE_SYNC_TOKEN (classic PAT or fine-grained)
+# with contents + pull_requests write on nasonawa/release.
+name: Sync openshift CI configs (test)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - test-ci-gen
+    paths:
+      - ci-generator/matrix.yaml
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_REPO: nasonawa/release
+  RELEASE_BASE_BRANCH: main
+  RELEASE_CONFIG_DIR: ci-operator/config/quay/quay
+  RELEASE_JOBS_DIR: ci-operator/jobs/quay/quay
+  RELEASE_MAKE_WHAT: quay/quay
+  CONTAINER_ENGINE: docker
+  PR_BRANCH: quay-ci-config-sync-test
+
+jobs:
+  sync-to-openshift-release:
+    name: Generate and open release PR
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout quay
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'test-ci-gen' || github.sha }}
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: ci-generator/uv.lock
+
+      - name: Generate ci-operator configs
+        id: generate
+        working-directory: ci-generator
+        run: |
+          uv sync --frozen --extra test
+          out="${RUNNER_TEMP}/generated-configs"
+          mkdir -p "$out"
+          uv run python generate.py --output "$out"
+          echo "out=$out" >> "$GITHUB_OUTPUT"
+          ls -la "$out"
+
+      - name: Checkout openshift/release fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.RELEASE_REPO }}
+          ref: ${{ env.RELEASE_BASE_BRANCH }}
+          token: ${{ secrets.OPENSHIFT_RELEASE_SYNC_TOKEN }}
+          path: release
+
+      - name: Sync managed configs into release tree
+        env:
+          GENERATED_DIR: ${{ steps.generate.outputs.out }}
+        run: |
+          set -euo pipefail
+          dest="release/${RELEASE_CONFIG_DIR}"
+          mkdir -p "$dest"
+
+          shopt -s nullglob
+          for src in "${GENERATED_DIR}"/*.yaml; do
+            cp "$src" "$dest/$(basename "$src")"
+          done
+
+          for existing in "$dest"/quay-quay-redhat-*__*.yaml; do
+            name="$(basename "$existing")"
+            if [[ ! -f "${GENERATED_DIR}/$name" ]]; then
+              rm "$existing"
+            fi
+          done
+
+      - name: Regenerate Prow jobs and determinize ci-operator config
+        working-directory: release
+        run: |
+          set -euo pipefail
+          docker version
+          # openshift/release/Makefile: `make jobs` runs prowgen; `make ci-operator-config` runs determinize-ci-operator.
+          make jobs WHAT="${RELEASE_MAKE_WHAT}"
+          make ci-operator-config
+
+      - name: Drop unrelated release tree changes
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              "${RELEASE_CONFIG_DIR}"/*|"${RELEASE_JOBS_DIR}"/*) continue ;;
+              *) git -C release restore --staged --worktree "$path" 2>/dev/null || git -C release clean -fd -- "$path" ;;
+            esac
+          done < <(git -C release diff --name-only -z)
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              "${RELEASE_CONFIG_DIR}"/*|"${RELEASE_JOBS_DIR}"/*) continue ;;
+              *) git -C release clean -fd -- "$path" ;;
+            esac
+          done < <(git -C release ls-files --others --exclude-standard -z)
+
+      - name: Detect release repo changes
+        id: detect
+        run: |
+          if [[ -z "$(git -C release status --porcelain -- "${RELEASE_CONFIG_DIR}" "${RELEASE_JOBS_DIR}")" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No quay ci-operator config or job changes; skipping PR."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create pull request on openshift/release fork
+        if: steps.detect.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.OPENSHIFT_RELEASE_SYNC_TOKEN }}
+          path: release
+          commit-message: |
+            chore(ci): sync quay ci-operator configs and prow jobs from test-ci-gen
+
+            Source: ${{ github.repository }}@${{ github.sha }}
+            Regenerated with: make jobs WHAT=quay/quay && make ci-operator-config
+          branch: ${{ env.PR_BRANCH }}
+          delete-branch: true
+          base: ${{ env.RELEASE_BASE_BRANCH }}
+          title: "test: sync quay ci-operator configs from nasonawa/quay test-ci-gen"
+          body: |
+            Automated test sync from [nasonawa/quay](https://github.com/nasonawa/quay) `test-ci-gen`.
+
+            - Quay commit: `${{ github.sha }}`
+            - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            - Matrix path: `ci-generator/matrix.yaml`
