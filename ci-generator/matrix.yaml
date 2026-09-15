@@ -14,3 +14,9 @@ quay:
         clouds: [aws,gcp]
         ocp: ["4.22","5.0"]
         test: e2e-install
+  - branch: redhat-3.17
+    jobs:
+      - tier: daily
+        clouds: [aws,gcp]
+        ocp: ["4.22","5.0"]
+        test: e2e-install
